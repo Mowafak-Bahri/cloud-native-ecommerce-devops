@@ -25,6 +25,9 @@ Thumbs.db
 # Docker
 docker-compose.override.yml
 
+# Node
+node_modules/
+
 # Logs
 *.log
 logs/
@@ -32,4 +35,3 @@ logs/
 # Temporary
 *.tmp
 *.bak
-
