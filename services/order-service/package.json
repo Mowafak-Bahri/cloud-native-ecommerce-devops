@@ -1,0 +1,29 @@
+{
+  "name": "order-service",
+  "version": "1.0.0",
+  "description": "Order management microservice for the cloud-native ecommerce platform",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "nodemon src/server.js",
+    "lint": "eslint ."
+  },
+  "dependencies": {
+    "axios": "^1.6.0",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "pg": "^8.11.3",
+    "pino": "^8.15.1",
+    "pino-pretty": "^10.2.0",
+    "aws-xray-sdk": "^3.5.3"
+  },
+  "devDependencies": {
+    "eslint": "^8.55.0",
+    "eslint-config-prettier": "^9.0.0",
+    "eslint-plugin-import": "^2.29.0",
+    "nodemon": "^3.0.1"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
