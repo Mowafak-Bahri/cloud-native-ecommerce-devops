@@ -1,0 +1,9 @@
+# Copy this file to terraform.tfvars and customize the values.
+
+aws_region   = "us-east-1"
+environment  = "dev"
+project_name = "ecommerce"
+vpc_cidr     = "10.0.0.0/16"
+db_name      = "ecommerce"
+db_username  = "admin"
+alarm_email  = "alerts@example.com"
