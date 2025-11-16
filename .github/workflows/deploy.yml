@@ -1,0 +1,94 @@
+name: Build and Deploy Services
+
+on:
+  push:
+    branches: ["main"]
+
+env:
+  AWS_REGION: us-east-1
+  PROJECT_NAME: ecommerce
+  ENVIRONMENT: dev
+  CLUSTER_NAME: ecommerce-dev-cluster
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - service: product-service
+            repo_suffix: product-service
+            directory: services/product-service
+            task_family: ecommerce-dev-product
+            ecs_service: ecommerce-dev-product
+            container_name: product-service
+          - service: order-service
+            repo_suffix: order-service
+            directory: services/order-service
+            task_family: ecommerce-dev-order
+            ecs_service: ecommerce-dev-order
+            container_name: order-service
+          - service: frontend
+            repo_suffix: frontend
+            directory: services/frontend
+            task_family: ecommerce-dev-frontend
+            ecs_service: ecommerce-dev-frontend
+            container_name: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build Docker image
+        run: |
+          REPOSITORY="${PROJECT_NAME}-${ENVIRONMENT}-${{ matrix.repo_suffix }}"
+          IMAGE_URI="${{ steps.login-ecr.outputs.registry }}/${REPOSITORY}:${GITHUB_SHA}"
+          docker build -t "$IMAGE_URI" -t "${{ steps.login-ecr.outputs.registry }}/${REPOSITORY}:latest" "${{ matrix.directory }}"
+
+      - name: Trivy Scan
+        uses: aquasecurity/trivy-action@v0.18.0
+        with:
+          image-ref: "${{ steps.login-ecr.outputs.registry }}/${{ env.PROJECT_NAME }}-${{ env.ENVIRONMENT }}-${{ matrix.repo_suffix }}:${{ github.sha }}"
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Push Docker image
+        run: |
+          REPOSITORY="${PROJECT_NAME}-${ENVIRONMENT}-${{ matrix.repo_suffix }}"
+          IMAGE_URI="${{ steps.login-ecr.outputs.registry }}/${REPOSITORY}:${GITHUB_SHA}"
+          docker push "$IMAGE_URI"
+          docker push "${{ steps.login-ecr.outputs.registry }}/${REPOSITORY}:latest"
+
+      - name: Prepare new task definition
+        run: |
+          REPOSITORY="${PROJECT_NAME}-${ENVIRONMENT}-${{ matrix.repo_suffix }}"
+          IMAGE_URI="${{ steps.login-ecr.outputs.registry }}/${REPOSITORY}:${GITHUB_SHA}"
+          aws ecs describe-task-definition --task-definition ${{ matrix.task_family }} --query 'taskDefinition' > task-def.json
+          cat task-def.json | \
+            jq 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)' | \
+            jq --arg IMAGE "$IMAGE_URI" --arg NAME "${{ matrix.container_name }}" '.containerDefinitions = (.containerDefinitions | map(if .name == $NAME then .image = $IMAGE else . end))' \
+            > new-task-def.json
+          aws ecs register-task-definition --cli-input-json file://new-task-def.json > register-output.json
+          echo "task_def_arn=$(cat register-output.json | jq -r '.taskDefinition.taskDefinitionArn')" >> $GITHUB_ENV
+
+      - name: Deploy ECS service
+        run: |
+          aws ecs update-service \
+            --cluster $CLUSTER_NAME \
+            --service ${{ matrix.ecs_service }} \
+            --task-definition "${{ env.task_def_arn }}" \
+            --force-new-deployment
+          aws ecs wait services-stable \
+            --cluster $CLUSTER_NAME \
+            --services ${{ matrix.ecs_service }}
