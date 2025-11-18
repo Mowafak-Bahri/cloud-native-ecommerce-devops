@@ -1,24 +1,41 @@
+import logging
 import os
 from contextlib import contextmanager
 from decimal import Decimal
 from typing import Generator, List, Optional
 
 import psycopg2
-from aws_xray_sdk.core import patch_all, xray_recorder
-from aws_xray_sdk.ext.fastapi.middleware import XRayMiddleware
+from pythonjsonlogger import jsonlogger
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
+from slowapi.util import get_remote_address
+
+# Configure logger
+logger = logging.getLogger("product-service")
+logger.setLevel(logging.INFO)
+logHandler = logging.StreamHandler()
+formatter = jsonlogger.JsonFormatter()
+logHandler.setFormatter(formatter)
+logger.addHandler(logHandler)
+
+
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, Request, status
 from psycopg2 import pool
 from psycopg2.extras import RealDictCursor
 from pydantic import BaseModel, Field
 
 load_dotenv()
 
-patch_all()
-xray_recorder.configure(service="ProductService")
+
 
 app = FastAPI(title="Product Service", version="1.0.0")
-app.add_middleware(XRayMiddleware, recorder=xray_recorder)
+limiter = Limiter(key_func=get_remote_address, default_limits=["60/minute"])
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.add_middleware(SlowAPIMiddleware)
+
 
 DB_POOL: Optional[pool.SimpleConnectionPool] = None
 
@@ -46,7 +63,7 @@ def init_connection_pool() -> None:
     try:
         DB_POOL = pool.SimpleConnectionPool(minconn, maxconn, **db_config)
     except Exception as exc:
-        print(f"Failed to initialize database pool: {exc}")
+        logger.error("Failed to initialize database pool", extra={"error": str(exc)})
         raise
 
 
@@ -70,7 +87,7 @@ def get_connection() -> Generator[psycopg2.extensions.connection, None, None]:
     except HTTPException:
         raise
     except Exception as exc:
-        print(f"Database connection error: {exc}")
+        logger.error("Database connection error", extra={"error": str(exc)})
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Database unavailable")
     finally:
         if conn and DB_POOL:
@@ -83,6 +100,7 @@ class Product(BaseModel):
     description: str = Field(..., min_length=1)
     price: float = Field(..., gt=0)
     stock: int = Field(..., ge=0)
+    category: str = Field(..., min_length=1, max_length=255)
 
 
 def serialize_product(record: dict) -> Product:
@@ -92,6 +110,7 @@ def serialize_product(record: dict) -> Product:
         description=record.get("description", ""),
         price=float(record.get("price")) if isinstance(record.get("price"), Decimal) else record.get("price"),
         stock=record.get("stock"),
+        category=record.get("category", "Uncategorized"),
     )
 
 
@@ -102,34 +121,32 @@ def initialize_database() -> None:
             name VARCHAR(255) NOT NULL,
             description TEXT,
             price DECIMAL(10, 2) NOT NULL CHECK (price >= 0),
-            stock INTEGER NOT NULL CHECK (stock >= 0)
+            stock INTEGER NOT NULL CHECK (stock >= 0),
+            category VARCHAR(255) NOT NULL DEFAULT 'Uncategorized'
         )
     """
     seed_sql = """
-        INSERT INTO products (name, description, price, stock) VALUES
-            ('Laptop Pro', 'High-performance laptop', 1299.99, 25),
-            ('Noise Cancelling Headphones', 'Wireless over-ear headphones', 249.00, 120),
-            ('Wireless Mouse', 'Ergonomic wireless mouse', 39.95, 200)
+        INSERT INTO products (name, description, price, stock, category) VALUES
+            ('Laptop Pro', 'High-performance laptop', 1299.99, 25, 'Electronics'),
+            ('Noise Cancelling Headphones', 'Wireless over-ear headphones', 249.00, 120, 'Audio'),
+            ('Wireless Mouse', 'Ergonomic wireless mouse', 39.95, 200, 'Electronics')
     """
 
     with get_connection() as conn:
         cursor = conn.cursor()
         try:
-            with xray_recorder.in_subsegment("create_table"):
-                cursor.execute(create_table_sql)
-            with xray_recorder.in_subsegment("count_products"):
-                cursor.execute("SELECT COUNT(*) FROM products")
-                row_count = cursor.fetchone()[0]
+            cursor.execute(create_table_sql)
+            cursor.execute("SELECT COUNT(*) FROM products")
+            row_count = cursor.fetchone()[0]
 
             if row_count == 0:
-                with xray_recorder.in_subsegment("seed_products"):
-                    cursor.execute(seed_sql)
+                cursor.execute(seed_sql)
 
             conn.commit()
-            print("Database initialized successfully")
+            logger.info("Database initialized successfully")
         except Exception as exc:
             conn.rollback()
-            print(f"Database initialization error: {exc}")
+            logger.error("Database initialization error", extra={"error": str(exc)})
             raise
         finally:
             cursor.close()
@@ -141,7 +158,7 @@ async def startup_event() -> None:
         init_connection_pool()
         initialize_database()
     except Exception as exc:
-        print(f"Startup error: {exc}")
+        logger.error("Startup error", extra={"error": str(exc)})
 
 
 @app.on_event("shutdown")
@@ -150,46 +167,47 @@ async def shutdown_event() -> None:
 
 
 @app.get("/health")
-async def health_check():
+@limiter.limit("30/minute")
+async def health_check(request: Request):
     try:
         with get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT 1")
             cursor.close()
-        return {"status": "healthy", "service": "product-service"}
+        return {"status": "healthy", "service": "product-service", "database": "connected"}
     except HTTPException:
         raise
     except Exception as exc:
-        print(f"Health check failed: {exc}")
+        logger.error("Health check failed", extra={"error": str(exc)})
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Database unhealthy")
 
 
 @app.get("/products", response_model=List[Product])
-async def get_products():
+@limiter.limit("60/minute")
+async def get_products(request: Request):
     with get_connection() as conn:
         cursor = conn.cursor(cursor_factory=RealDictCursor)
         try:
-            with xray_recorder.in_subsegment("get_products_query"):
-                cursor.execute("SELECT id, name, description, price, stock FROM products ORDER BY id")
+            cursor.execute("SELECT id, name, description, price, stock, category FROM products ORDER BY id")
             records = cursor.fetchall()
             return [serialize_product(record) for record in records]
         except Exception as exc:
-            print(f"Error fetching products: {exc}")
+            logger.error("Error fetching products", extra={"error": str(exc)})
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to fetch products")
         finally:
             cursor.close()
 
 
 @app.get("/products/{product_id}", response_model=Product)
-async def get_product(product_id: int):
+@limiter.limit("60/minute")
+async def get_product(request: Request, product_id: int):
     with get_connection() as conn:
         cursor = conn.cursor(cursor_factory=RealDictCursor)
         try:
-            with xray_recorder.in_subsegment("get_product_query"):
-                cursor.execute(
-                    "SELECT id, name, description, price, stock FROM products WHERE id = %s",
-                    (product_id,),
-                )
+            cursor.execute(
+                "SELECT id, name, description, price, stock, category FROM products WHERE id = %s",
+                (product_id,),
+            )
             record = cursor.fetchone()
             if not record:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
@@ -197,32 +215,35 @@ async def get_product(product_id: int):
         except HTTPException:
             raise
         except Exception as exc:
-            print(f"Error fetching product {product_id}: {exc}")
+            logger.error(
+                "Error fetching product",
+                extra={"error": str(exc), "product_id": product_id},
+            )
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to fetch product")
         finally:
             cursor.close()
 
 
 @app.post("/products", response_model=Product, status_code=status.HTTP_201_CREATED)
-async def create_product(product: Product):
+@limiter.limit("15/minute")
+async def create_product(request: Request, product: Product):
     with get_connection() as conn:
         cursor = conn.cursor(cursor_factory=RealDictCursor)
         try:
-            with xray_recorder.in_subsegment("create_product_query"):
-                cursor.execute(
-                    """
-                    INSERT INTO products (name, description, price, stock)
-                    VALUES (%s, %s, %s, %s)
-                    RETURNING id, name, description, price, stock
-                    """,
-                    (product.name, product.description, product.price, product.stock),
-                )
+            cursor.execute(
+                """
+                INSERT INTO products (name, description, price, stock)
+                VALUES (%s, %s, %s, %s)
+                RETURNING id, name, description, price, stock
+                """,
+                (product.name, product.description, product.price, product.stock),
+            )
             created = cursor.fetchone()
             conn.commit()
             return serialize_product(created)
         except Exception as exc:
             conn.rollback()
-            print(f"Error creating product: {exc}")
+            logger.error("Error creating product", extra={"error": str(exc)})
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to create product")
         finally:
             cursor.close()
