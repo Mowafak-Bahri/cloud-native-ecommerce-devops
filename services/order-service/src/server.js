@@ -2,6 +2,9 @@ const express = require("express");
 const axios = require("axios");
 const dotenv = require("dotenv");
 const pino = require("pino");
+const helmet = require("helmet");
+const cors = require("cors");
+const rateLimit = require("express-rate-limit");
 const AWSXRay = require("aws-xray-sdk");
 const http = require("http");
 const https = require("https");
@@ -43,7 +46,38 @@ async function initializeDatabase() {
 
 const app = express();
 app.use(AWSXRay.express.openSegment("OrderService"));
+// Helmet hardens common HTTP headers before requests reach business logic.
+app.use(
+  helmet({
+    contentSecurityPolicy: false, // CSP handled upstream
+    crossOriginEmbedderPolicy: false,
+    crossOriginResourcePolicy: { policy: "same-site" },
+    referrerPolicy: { policy: "no-referrer" },
+    frameguard: { action: "deny" },
+    hsts: process.env.NODE_ENV === "production" ? undefined : false, // ALB terminates TLS
+  })
+);
+const allowedOrigins = process.env.ALLOWED_ORIGINS?.split(',') || ['http://localhost:3000'];
+
+app.use(cors({
+  origin: function (origin, callback) {
+    if (!origin || allowedOrigins.indexOf(origin) !== -1) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
+  credentials: true
+}));
 app.use(express.json());
+
+// Apply rate limiting to all requests
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // Limit each IP to 100 requests per windowMs
+  message: "Too many requests from this IP, please try again after 15 minutes",
+});
+app.use(limiter);
 
 app.get("/health", async (req, res) => {
   try {
@@ -51,26 +85,26 @@ app.get("/health", async (req, res) => {
     res.json({ status: "healthy", service: "order-service" });
   } catch (error) {
     logger.error({ err: error }, "Health check failed");
-    res.status(503).json({ error: "Database unavailable" });
+    next(error);
   }
 });
 
 app.get("/orders", async (req, res) => {
   try {
-    const result = await pool.query(
+    const orders = await pool.query(
       "SELECT id, product_id, quantity, total_price, status, created_at FROM orders ORDER BY created_at DESC"
     );
-    res.json(result.rows);
+    res.json(orders.rows);
   } catch (error) {
     logger.error({ err: error }, "Failed to fetch orders");
-    res.status(500).json({ error: "Failed to fetch orders" });
+    next(error);
   }
 });
 
 app.post("/orders", async (req, res) => {
   const { product_id: productId, quantity } = req.body;
-  if (!productId || !quantity || quantity <= 0) {
-    return res.status(400).json({ error: "product_id and quantity must be provided" });
+  if (!productId || !quantity || !Number.isInteger(productId) || productId <= 0 || !Number.isInteger(quantity) || quantity <= 0 || quantity > 10000) {
+    return res.status(400).json({ error: "product_id must be a positive integer and quantity must be an integer between 1 and 10000" });
   }
 
   try {
@@ -87,8 +121,8 @@ app.post("/orders", async (req, res) => {
       VALUES ($1, $2, $3, $4)
       RETURNING id, product_id, quantity, total_price, status, created_at
     `;
-    const result = await pool.query(insertSQL, [productId, quantity, totalPrice, "CONFIRMED"]);
-    res.status(201).json(result.rows[0]);
+    const createdOrder = await pool.query(insertSQL, [productId, quantity, totalPrice, "PENDING"]);
+    res.status(201).json(createdOrder.rows[0]);
   } catch (error) {
     if (axios.isAxiosError(error)) {
       const status = error.response?.status || 502;
@@ -100,20 +134,45 @@ app.post("/orders", async (req, res) => {
     }
 
     logger.error({ err: error }, "Failed to create order");
-    res.status(500).json({ error: "Failed to create order" });
+    next(error);
   }
 });
 
 app.use(AWSXRay.express.closeSegment());
 
+// Centralized error handling middleware
+app.use((err, req, res, next) => {
+  logger.error({ err }, "Unhandled error occurred");
+  const statusCode = err.statusCode || 500;
+  const message = err.message || "An unexpected error occurred";
+  res.status(statusCode).json({ error: message });
+});
+
 const server = http.createServer(app);
 
-server.listen(PORT, async () => {
-  try {
-    await initializeDatabase();
-    logger.info(`Order service running on port ${PORT}`);
-  } catch (error) {
-    logger.error({ err: error }, "Failed to initialize database");
-    process.exit(1);
+server.listen(PORT, () => {
+  const namespace = AWSXRay.getNamespace();
+  const bootstrapSegment = new AWSXRay.Segment("OrderServiceBootstrap");
+
+  const runBootstrap = async () => {
+    try {
+      await initializeDatabase();
+      logger.info(`Order service running on port ${PORT}`);
+    } catch (error) {
+      bootstrapSegment.addError(error);
+      logger.error({ err: error }, "Failed to initialize database");
+      process.exit(1);
+    } finally {
+      bootstrapSegment.close();
+    }
+  };
+
+  if (namespace) {
+    namespace.run(() => {
+      AWSXRay.setSegment(bootstrapSegment);
+      runBootstrap().finally(() => AWSXRay.setSegment(null));
+    });
+  } else {
+    runBootstrap();
   }
 });
